@@ -11,8 +11,9 @@ from jax import random, jit
 from jax import config
 from functools import partial
 from jax.nn import relu, tanh
-import jaxopt
 from jax import grad
+import jaxopt
+from flax import struct
 
 import matplotlib.pyplot as plt
 from scipy.special import roots_jacobi, jacobi
@@ -126,20 +127,53 @@ def MLP(layers, activation=relu):
             inputs = activation(outputs)
 
         W, b = params[-1]
-        W, b = params[-1]
         outputs = jnp.dot(inputs, W) + b
         return outputs
 
     return init, apply
 
 
+def gather_disp(nodal_values_padded, ids, mask):
+    return nodal_values_padded[ids] * mask[:, None]
+
+
+def deviator(t):
+    return t - jnp.trace(t) / 2 * jnp.eye(2)
+
+
+def voigt_strain(dphi_dx, dphi_dy, disp):
+    du_dx = jnp.sum(dphi_dx * disp[:, 0])
+    du_dy = jnp.sum(dphi_dy * disp[:, 0])
+    dv_dx = jnp.sum(dphi_dx * disp[:, 1])
+    dv_dy = jnp.sum(dphi_dy * disp[:, 1])
+    return jnp.array([du_dx, dv_dy, du_dy + dv_dx])
+
+
+def j2_return_mapping(strain, eqv_p, D_material, yield_stress, hardening_factor):
+    stress_trial = D_material @ strain
+    stress_trial_m = jnp.array(
+        [[stress_trial[0], stress_trial[2]], [stress_trial[2], stress_trial[1]]]
+    )
+    s = deviator(stress_trial_m)
+    s_norm = jnp.linalg.norm(s)
+    normal = s / (s_norm + 1e-8)
+
+    f = s_norm - jnp.sqrt(2 / 3) * (yield_stress + hardening_factor * eqv_p)
+    gamma = jnp.maximum(f, 0.0) / (2 * mu + 2 / 3 * hardening_factor)
+
+    stress_m = stress_trial_m - 2 * mu * gamma * normal
+    stress = jnp.array([stress_m[0, 0], stress_m[1, 1], stress_m[0, 1]])
+
+    deps_p = gamma * jnp.array([normal[0, 0], normal[1, 1], 2.0 * normal[0, 1]])
+    eqv_new = eqv_p + jnp.sqrt(2 / 3) * gamma
+
+    return stress, eqv_new, deps_p
+
+
 # ========== Neural Integraed Meshless (NIM) ==========
 class NIM:
-    def __init__(self, u_layers):
+    def __init__(self, u_layers, plastic_state):
 
-        # =========================
-        # NN
-        # =========================
         self.u_init, self.disp_apply = MLP(u_layers, activation=tanh)
         u_params = self.u_init(random.PRNGKey(1995))
         self.u_params = jax.tree.map(lambda x: x * 0.001, u_params)
@@ -147,14 +181,16 @@ class NIM:
 
         self.bc_penalty_factor = 1e5
         self.D_material = D
+        self.yield_stress = 8
+        self.hardening_factor = 1
+
         self.rkpm_nodes = rkpm_nodes
         self.max_neighbors = max_neighbors
 
+        self.state = plastic_state
+
         self.callback_calls = 0
 
-        # =========================
-        # STACK SUBDOMAIN DATA
-        # =========================
         self.coords_all = jnp.stack([sd[0] for sd in subdomain])
         self.weights_all = jnp.stack([sd[1] for sd in subdomain])
         self.jacobians_all = jnp.stack([sd[2] for sd in subdomain])
@@ -166,22 +202,28 @@ class NIM:
         self.dphi_dx_all = self.dphi_all[..., 0]
         self.dphi_dy_all = self.dphi_all[..., 1]
 
-        # =========================
-        # PROCESS BC → PADDED (NO NONE)
-        # =========================
         self.traction_subdomains = self.extract_traction(bc_subdomain_quad_data)
         self.ebc_subdomains = self.extract_ebc(bc_subdomain_quad_data)
 
         self.build_bc_arrays()
         self.precompute_neighbors()
 
-        # =========================
-        # OPTIMIZER
-        # =========================
+        # The passed-in plastic_state only carries the interior-quadrature
+        # history. The EBC weak term lives on the padded EBC quadrature points
+        # (self.ebc_Wb has shape (num_subdomains, n_ebc_padded)), so allocate a
+        # matching zero plastic history there and fold it into the state.
+        num_sub, n_ebc = self.ebc_Wb.shape
+        self.state = self.state.replace(
+            ebc_plastic_strain=jnp.zeros((num_sub, n_ebc, 3)),
+            ebc_eqv_plastic_strain=jnp.zeros((num_sub, n_ebc)),
+        )
+
         self.optimizer = jaxopt.ScipyMinimize(
-            fun=lambda params: self.loss(params),
+            fun=lambda params, state_pre, current_load: self.loss(
+                params, state_pre, current_load
+            ),
             method="L-BFGS-B",
-            maxiter=10000,
+            maxiter=100000,
             callback=self.callback,
             jit=True,
             options={
@@ -193,22 +235,7 @@ class NIM:
             },
         )
 
-        self.P_from_F = jax.jit(jax.grad(self.strain_energy_density))
-
         self.build_residual()
-
-    def strain_energy_density(self, F):
-        C = F.T @ F
-        E = 0.5 * (C - jnp.eye(2))
-        J = jnp.maximum(jnp.linalg.det(F), 1e-5)
-        I1 = jnp.trace(C)
-
-        E_vec = jnp.array([E[0, 0], E[1, 1], 2.0 * E[0, 1]])
-
-        S_vec = self.D_material @ E_vec
-
-        # return 0.5 * jnp.dot(E_vec, S_vec)
-        return 0.5 * lam * jnp.log(J) ** 2 - mu * jnp.log(J) + 0.5 * mu * (I1 - 3)
 
     def precompute_neighbors(self):
         def compute_for_subdomain(coords):
@@ -223,6 +250,7 @@ class NIM:
         ebc_ids_all, ebc_neighbor_mask_all = jax.vmap(compute_for_subdomain)(
             self.ebc_coords
         )
+
         ebc_phi_all, ebc_dphi_all = jax.vmap(
             lambda coords: calculate_shape_functions_vmapped_for_subdomain(
                 coords, self.rkpm_nodes, r_subdomain, self.max_neighbors
@@ -293,11 +321,7 @@ class NIM:
                 )
         return out
 
-    # =========================
-    # PAD BC → VMAP READY
-    # =========================
     def build_bc_arrays(self):
-
         def pad(data_list):
             max_qp = max([0 if d is None else d["coords"].shape[0] for d in data_list])
 
@@ -340,23 +364,23 @@ class NIM:
             self.ebc_mask,
         ) = pad(self.ebc_subdomains)
 
-    # =========================
-    # RESIDUAL (FULL VMAP)
-    # =========================
-
     def build_residual(self):
 
         disp_apply = self.disp_apply
         input_para = self.input_para
-        P_from_F = self.P_from_F
+
         bc_penalty_factor = self.bc_penalty_factor
         D_material = self.D_material
         rkpm_nodes = self.rkpm_nodes
         max_neighbors = self.max_neighbors
+        yield_stress = self.yield_stress
+        hardening_factor = self.hardening_factor
 
         @jax.jit
         def residual_fn(
             params,
+            state_pre,
+            current_load,
             coords_all,
             weights_all,
             jacobians_all,
@@ -380,52 +404,44 @@ class NIM:
             ebc_phi_all,
             ebc_dphi_all,
         ):
+            plastic_strain_all = state_pre.plastic_strain
+            eqv_all = state_pre.eqv_plastic_strain
+            ebc_plastic_all = state_pre.ebc_plastic_strain
+            ebc_eqv_all = state_pre.ebc_eqv_plastic_strain
 
             nodal_values = disp_apply(params, input_para).reshape(-1, 2)
             nodal_values_padded = jnp.vstack([nodal_values, jnp.zeros((1, 2))])
 
-            def gather_disp(ids, mask):
-                disp = nodal_values_padded[ids]
-                return disp * mask[:, None]
+            gather = partial(gather_disp, nodal_values_padded)
 
-            def qp_kernel(dphi_dx, dphi_dy, disp, dwdx, dwdy, w, J):
+            def qp_kernel(dphi_dx, dphi_dy, disp, dwdx, dwdy, w, J, eps_p, eqv_p):
+                strain = voigt_strain(dphi_dx, dphi_dy, disp) - eps_p
 
-                du_dx = jnp.sum(dphi_dx * disp[:, 0])
-                du_dy = jnp.sum(dphi_dy * disp[:, 0])
-                dv_dx = jnp.sum(dphi_dx * disp[:, 1])
-                dv_dy = jnp.sum(dphi_dy * disp[:, 1])
-
-                F = jnp.array([[1.0 + du_dx, du_dy], [dv_dx, 1.0 + dv_dy]])
-
-                P = P_from_F(F)
+                stress, _, _ = j2_return_mapping(
+                    strain, eqv_p, D_material, yield_stress, hardening_factor
+                )
 
                 r = jnp.array(
-                    [dwdx * P[0, 0] + dwdy * P[0, 1], dwdx * P[1, 0] + dwdy * P[1, 1]]
+                    [
+                        dwdx * stress[0] + dwdy * stress[2],
+                        dwdx * stress[2] + dwdy * stress[1],
+                    ]
                 )
 
                 return r * w * J
 
-            def ebc_weak(w, dphi_dx, dphi_dy, disp, weight, J):
-                F = jnp.eye(2) + jnp.array(
-                    [
-                        [jnp.sum(dphi_dx * disp[:, 0]), jnp.sum(dphi_dy * disp[:, 0])],
-                        [jnp.sum(dphi_dx * disp[:, 1]), jnp.sum(dphi_dy * disp[:, 1])],
-                    ]
+            def ebc_weak(w, dphi_dx, dphi_dy, disp, weight, J, eps_p, eqv_p):
+                strain = voigt_strain(dphi_dx, dphi_dy, disp) - eps_p
+                stress, _, _ = j2_return_mapping(
+                    strain, eqv_p, D_material, yield_stress, hardening_factor
                 )
-                strain = 0.5 * (F.T @ F - jnp.eye(2))
-                stress = D_material @ jnp.array(
-                    [strain[0, 0], strain[1, 1], 2 * strain[0, 1]]
-                ).reshape(
-                    3,
-                )
-                PK1 = F @ jnp.array([[stress[0], stress[2]], [stress[2], stress[1]]])
 
                 nx, ny = -1.0, 0.0
 
                 traction = jnp.array(
                     [
-                        PK1[0, 0] * nx + PK1[0, 1] * ny,
-                        PK1[1, 0] * nx + PK1[1, 1] * ny,
+                        stress[0] * nx + stress[2] * ny,
+                        stress[2] * nx + stress[1] * ny,
                     ]
                 )
 
@@ -454,9 +470,13 @@ class NIM:
                 ebc_neighbor_mask_i,
                 phi_b,
                 dphi_b,
+                eps_p_sub,
+                eqv_sub,
+                ebc_eps_p_sub,
+                ebc_eqv_sub,
             ):
 
-                disp_neighbors = jax.vmap(gather_disp)(quad_ids_i, quad_mask_i)
+                disp_neighbors = jax.vmap(gather)(quad_ids_i, quad_mask_i)
 
                 R_internal = jax.vmap(qp_kernel)(
                     dphi_x,
@@ -466,12 +486,14 @@ class NIM:
                     DWy_i.squeeze(),
                     weights,
                     jacobians,
+                    eps_p_sub,
+                    eqv_sub,
                 )
 
                 R_internal_sum = jnp.sum(R_internal, axis=0)
 
                 # traction
-                traction_vec = jnp.array([10.0, 0.0])
+                traction_vec = jnp.array([current_load, 0.0])
                 R_tr = jax.vmap(lambda w, wt, J, m: m * (w * traction_vec * wt * J))(
                     tr_Wb, tr_w, tr_j, tr_mask
                 )
@@ -479,7 +501,7 @@ class NIM:
                 R_traction = jnp.sum(R_tr, axis=0)
 
                 # EBC
-                disp_neighbors_b = jax.vmap(gather_disp)(ebc_ids_i, ebc_neighbor_mask_i)
+                disp_neighbors_b = jax.vmap(gather)(ebc_ids_i, ebc_neighbor_mask_i)
 
                 u_qp = jax.vmap(lambda phi, disp: jnp.sum(phi[:, None] * disp, axis=0))(
                     phi_b, disp_neighbors_b
@@ -493,6 +515,7 @@ class NIM:
 
                 R_ebc = jnp.sum(R_ebc_qp, axis=0)
 
+                # plastic history tracked on the EBC quadrature points
                 R_ebc_weak_qp = jax.vmap(ebc_weak)(
                     ebc_Wb,
                     dphi_b[:, :, 0],
@@ -500,6 +523,8 @@ class NIM:
                     disp_neighbors_b,
                     ebc_w,
                     ebc_j,
+                    ebc_eps_p_sub,
+                    ebc_eqv_sub,
                 )
                 R_ebc_weak = jnp.sum(R_ebc_weak_qp, axis=0)
 
@@ -532,6 +557,10 @@ class NIM:
                 ebc_neighbor_mask_all,
                 ebc_phi_all,
                 ebc_dphi_all,
+                plastic_strain_all,
+                eqv_all,
+                ebc_plastic_all,
+                ebc_eqv_all,
             )
 
             return jnp.mean(loss_all)
@@ -564,22 +593,97 @@ class NIM:
             self.ebc_dphi_all,
         )
 
-    def loss(self, params):
-        return self.residual_fn(params, *self.get_static_data())
+    def loss(self, params, state_pre, current_load):
+        # state_pre and current_load are passed in (not read from self) so the
+        # optimizer's jitted objective treats them as traced inputs that change
+        # each load step, instead of baking in the first step's values.
+        return self.residual_fn(
+            params, state_pre, current_load, *self.get_static_data()
+        )
 
-    def train(self):
+    def update_plastic_state(self, params, state_pre):
+        D_material = self.D_material
+        yield_stress = self.yield_stress
+        hardening_factor = self.hardening_factor
+
+        nodal_values = self.disp_apply(params, self.input_para).reshape(-1, 2)
+        nodal_values_padded = jnp.vstack([nodal_values, jnp.zeros((1, 2))])
+
+        gather = partial(gather_disp, nodal_values_padded)
+
+        def return_map_qp(dphi_dx, dphi_dy, disp, eps_p, eqv_p):
+            strain = voigt_strain(dphi_dx, dphi_dy, disp) - eps_p
+            stress_new, eqv_new, deps_p = j2_return_mapping(
+                strain, eqv_p, D_material, yield_stress, hardening_factor
+            )
+            eps_p_new = eps_p + deps_p
+            return eps_p_new, eqv_new, stress_new
+
+        def subdomain_update(
+            dphi_x, dphi_y, quad_ids_i, quad_mask_i, eps_p_sub, eqv_sub
+        ):
+            disp_neighbors = jax.vmap(gather)(quad_ids_i, quad_mask_i)
+            return jax.vmap(return_map_qp)(
+                dphi_x, dphi_y, disp_neighbors, eps_p_sub, eqv_sub
+            )
+
+        eps_p_new, eqv_new, stress_new = jax.vmap(subdomain_update)(
+            self.dphi_dx_all,
+            self.dphi_dy_all,
+            self.quad_ids_all,
+            self.quad_mask_all,
+            state_pre.plastic_strain,
+            state_pre.eqv_plastic_strain,
+        )
+
+        # same return map at the EBC quadrature points, using the precomputed
+        # EBC shape-function derivatives / neighbours
+        ebc_eps_p_new, ebc_eqv_new, _ = jax.vmap(subdomain_update)(
+            self.ebc_dphi_all[..., 0],
+            self.ebc_dphi_all[..., 1],
+            self.ebc_ids_all,
+            self.ebc_neighbor_mask_all,
+            state_pre.ebc_plastic_strain,
+            state_pre.ebc_eqv_plastic_strain,
+        )
+
+        return PlasticVariables(
+            plastic_strain=eps_p_new,
+            eqv_plastic_strain=eqv_new,
+            stress=stress_new,
+            ebc_plastic_strain=ebc_eps_p_new,
+            ebc_eqv_plastic_strain=ebc_eqv_new,
+        )
+
+    def train_full_flow(self, load_step, state=None):
+        # default to the EBC-augmented state built in __init__
+        if state is None:
+            state = self.state
+        for i in range(load_step):
+            load_scale = (i + 1) / load_step
+            logger.info(f"Load step: {i + 1}, load scale: {load_scale}")
+            self.current_load = load_scale * 10
+            self.state_pre = state
+
+            state = self.train_single_step()  # carry the updated state forward
+        self.state = state
+        return state
+
+    def train_single_step(self):
         logger.info("Starting NIM training...")
         sys.stdout.flush()
         self.i_opt = 0
         self.start_time = time.time()
         try:
-            sol = self.optimizer.run(init_params=self.u_params)
+            sol = self.optimizer.run(self.u_params, self.state_pre, self.current_load)
             self.u_params = sol.params  # Update params after optimization
             self.solution = sol
             logger.info("NIM training completed successfully.")
         except Exception as e:
             logger.info(f"An error occurred during NIM training: {e}")
-        return
+        # write side of the plastic update, from the converged displacement
+        new_state = self.update_plastic_state(self.u_params, self.state_pre)
+        return new_state
 
     def callback(self, params):
         # Callback to print progress during optimization
@@ -587,7 +691,7 @@ class NIM:
         self.callback_calls += 1  # Increment the counter
         # Use state.value to get the concrete loss value
         if self.i_opt % 100 == 0:
-            loss_val = self.loss(params)
+            loss_val = self.loss(params, self.state_pre, self.current_load)
             logger.info(
                 f"Iteration {self.i_opt}, Loss: {loss_val:.6e}, Time: {time.time() - self.start_time:.2f}s"
             )
@@ -610,9 +714,27 @@ class NIM:
         return jnp.sum(phi[:, :, None] * disp, axis=1)
 
 
+@struct.dataclass
+class PlasticVariables:
+    plastic_strain: jnp.ndarray
+    eqv_plastic_strain: jnp.ndarray
+    stress: jnp.ndarray
+    # plastic history on the padded EBC quadrature points (filled in by NIM,
+    # once the padded EBC shape is known)
+    ebc_plastic_strain: jnp.ndarray = None
+    ebc_eqv_plastic_strain: jnp.ndarray = None
+
+
+state = PlasticVariables(
+    plastic_strain=jnp.stack([jnp.zeros((sd[0].shape[0], 3)) for sd in subdomain]),
+    eqv_plastic_strain=jnp.stack([jnp.zeros((sd[0].shape[0],)) for sd in subdomain]),
+    stress=jnp.stack([jnp.zeros((sd[0].shape[0], 3)) for sd in subdomain]),
+)
+
+load_step = 1
 u_layers = [1, 10, 2 * num_rkpm_nodes]
-nim_model = NIM(u_layers)
-nim_model.train()
+nim_model = NIM(u_layers, plastic_state=state)
+nim_model.train_full_flow(load_step=load_step)
 
 # After training, you can check the counter
 logger.info(f"Callback was called {nim_model.callback_calls} times during training.")
