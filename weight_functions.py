@@ -191,106 +191,78 @@ def construct_bc_weight_function(
         subdomain_actual_length_x = bbox_xmax - bbox_xmin
         subdomain_actual_length_y = bbox_ymax - bbox_ymin
 
-        # --- Left Boundary (x = domain_bounds[0]) ---
-        if (
-            jnp.abs(bbox_xmin - domain_bounds[0]) < tolerance
-            and subdomain_actual_length_y > tolerance
-        ):
-            # Quadrature along Y-direction on the left edge
-            bc_segment_ymin = bbox_ymin
-            bc_segment_ymax = bbox_ymax
-            bc_segment_length_y = bc_segment_ymax - bc_segment_ymin
+        quad_domain_length_x = subdomain_actual_length_x / subdomain_partition
+        quad_domain_length_y = subdomain_actual_length_y / subdomain_partition
 
-            # Scale 1D Lobatto points to the y-segment
-            scaled_quad_y_coord = bc_segment_ymin + 0.5 * bc_segment_length_y * (
-                quad_coord_1d + 1
-            )
-            scaled_quad_x_coord = jnp.full_like(
-                scaled_quad_y_coord, domain_bounds[0]
-            )  # x is fixed at domain_bounds[0]
+        for i in range(subdomain_partition):
+            for j in range(subdomain_partition):
+                current_quad_domain_xmin = bbox_xmin + i * quad_domain_length_x
+                current_quad_domain_ymin = bbox_ymin + j * quad_domain_length_y
 
-            bc_coords = jnp.stack([scaled_quad_x_coord, scaled_quad_y_coord], axis=-1)
-            current_center_boundary_quad_coords_list.append(bc_coords)
+                scaled_quad_x_coord = (
+                    current_quad_domain_xmin
+                    + 0.5 * quad_domain_length_x * (quad_coord_1d + 1)
+                )
+                scaled_quad_y_coord = (
+                    current_quad_domain_ymin
+                    + 0.5 * quad_domain_length_y * (quad_coord_1d + 1)
+                )
 
-            current_center_boundary_quad_weights_list.append(quad_weight_1d)
-            current_center_boundary_quad_jacobians_list.append(
-                jnp.full_like(quad_weight_1d, 0.5 * bc_segment_length_y)
-            )
+                # --- Left Boundary (x = domain_bounds[0]) ---
+                if (
+                    i == 0
+                    and jnp.abs(bbox_xmin - domain_bounds[0]) < tolerance
+                    and subdomain_actual_length_y > tolerance
+                ):
+                    bc_x_coord = jnp.full_like(scaled_quad_y_coord, domain_bounds[0])
+                    bc_coords = jnp.stack([bc_x_coord, scaled_quad_y_coord], axis=-1)
+                    current_center_boundary_quad_coords_list.append(bc_coords)
+                    current_center_boundary_quad_weights_list.append(quad_weight_1d)
+                    current_center_boundary_quad_jacobians_list.append(
+                        jnp.full_like(quad_weight_1d, 0.5 * quad_domain_length_y)
+                    )
 
-        # --- Right Boundary (x = domain_bounds[1]) ---
-        if (
-            jnp.abs(bbox_xmax - domain_bounds[1]) < tolerance
-            and subdomain_actual_length_y > tolerance
-        ):
-            # Quadrature along Y-direction on the right edge
-            bc_segment_ymin = bbox_ymin
-            bc_segment_ymax = bbox_ymax
-            bc_segment_length_y = bc_segment_ymax - bc_segment_ymin
+                # --- Right Boundary (x = domain_bounds[1]) ---
+                if (
+                    i == subdomain_partition - 1
+                    and jnp.abs(bbox_xmax - domain_bounds[1]) < tolerance
+                    and subdomain_actual_length_y > tolerance
+                ):
+                    bc_x_coord = jnp.full_like(scaled_quad_y_coord, domain_bounds[1])
+                    bc_coords = jnp.stack([bc_x_coord, scaled_quad_y_coord], axis=-1)
+                    current_center_boundary_quad_coords_list.append(bc_coords)
+                    current_center_boundary_quad_weights_list.append(quad_weight_1d)
+                    current_center_boundary_quad_jacobians_list.append(
+                        jnp.full_like(quad_weight_1d, 0.5 * quad_domain_length_y)
+                    )
 
-            scaled_quad_y_coord = bc_segment_ymin + 0.5 * bc_segment_length_y * (
-                quad_coord_1d + 1
-            )
-            scaled_quad_x_coord = jnp.full_like(
-                scaled_quad_y_coord, domain_bounds[1]
-            )  # x is fixed at domain_bounds[1]
+                # --- Bottom Boundary (y = domain_bounds[2]) ---
+                if (
+                    j == 0
+                    and jnp.abs(bbox_ymin - domain_bounds[2]) < tolerance
+                    and subdomain_actual_length_x > tolerance
+                ):
+                    bc_y_coord = jnp.full_like(scaled_quad_x_coord, domain_bounds[2])
+                    bc_coords = jnp.stack([scaled_quad_x_coord, bc_y_coord], axis=-1)
+                    current_center_boundary_quad_coords_list.append(bc_coords)
+                    current_center_boundary_quad_weights_list.append(quad_weight_1d)
+                    current_center_boundary_quad_jacobians_list.append(
+                        jnp.full_like(quad_weight_1d, 0.5 * quad_domain_length_x)
+                    )
 
-            bc_coords = jnp.stack([scaled_quad_x_coord, scaled_quad_y_coord], axis=-1)
-            current_center_boundary_quad_coords_list.append(bc_coords)
-
-            current_center_boundary_quad_weights_list.append(quad_weight_1d)
-            current_center_boundary_quad_jacobians_list.append(
-                jnp.full_like(quad_weight_1d, 0.5 * bc_segment_length_y)
-            )
-
-        # --- Bottom Boundary (y = domain_bounds[2]) ---
-        if (
-            jnp.abs(bbox_ymin - domain_bounds[2]) < tolerance
-            and subdomain_actual_length_x > tolerance
-        ):
-            # Quadrature along X-direction on the bottom edge
-            bc_segment_xmin = bbox_xmin
-            bc_segment_xmax = bbox_xmax
-            bc_segment_length_x = bc_segment_xmax - bc_segment_xmin
-
-            scaled_quad_x_coord = bc_segment_xmin + 0.5 * bc_segment_length_x * (
-                quad_coord_1d + 1
-            )
-            scaled_quad_y_coord = jnp.full_like(
-                scaled_quad_x_coord, domain_bounds[2]
-            )  # y is fixed at domain_bounds[2]
-
-            bc_coords = jnp.stack([scaled_quad_x_coord, scaled_quad_y_coord], axis=-1)
-            current_center_boundary_quad_coords_list.append(bc_coords)
-
-            current_center_boundary_quad_weights_list.append(quad_weight_1d)
-            current_center_boundary_quad_jacobians_list.append(
-                jnp.full_like(quad_weight_1d, 0.5 * bc_segment_length_x)
-            )
-
-        # --- Top Boundary (y = domain_bounds[3]) ---
-        if (
-            jnp.abs(bbox_ymax - domain_bounds[3]) < tolerance
-            and subdomain_actual_length_x > tolerance
-        ):
-            # Quadrature along X-direction on the top edge
-            bc_segment_xmin = bbox_xmin
-            bc_segment_xmax = bbox_xmax
-            bc_segment_length_x = bc_segment_xmax - bc_segment_xmin
-
-            scaled_quad_x_coord = bc_segment_xmin + 0.5 * bc_segment_length_x * (
-                quad_coord_1d + 1
-            )
-            scaled_quad_y_coord = jnp.full_like(
-                scaled_quad_x_coord, domain_bounds[3]
-            )  # y is fixed at domain_bounds[3]
-
-            bc_coords = jnp.stack([scaled_quad_x_coord, scaled_quad_y_coord], axis=-1)
-            current_center_boundary_quad_coords_list.append(bc_coords)
-
-            current_center_boundary_quad_weights_list.append(quad_weight_1d)
-            current_center_boundary_quad_jacobians_list.append(
-                jnp.full_like(quad_weight_1d, 0.5 * bc_segment_length_x)
-            )
+                # --- Top Boundary (y = domain_bounds[3]) ---
+                if (
+                    j == subdomain_partition - 1
+                    and jnp.abs(bbox_ymax - domain_bounds[3]) < tolerance
+                    and subdomain_actual_length_x > tolerance
+                ):
+                    bc_y_coord = jnp.full_like(scaled_quad_x_coord, domain_bounds[3])
+                    bc_coords = jnp.stack([scaled_quad_x_coord, bc_y_coord], axis=-1)
+                    current_center_boundary_quad_coords_list.append(bc_coords)
+                    current_center_boundary_quad_weights_list.append(quad_weight_1d)
+                    current_center_boundary_quad_jacobians_list.append(
+                        jnp.full_like(quad_weight_1d, 0.5 * quad_domain_length_x)
+                    )
 
         # Consolidate boundary points for the current center
         if (
